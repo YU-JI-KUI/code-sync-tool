@@ -1,0 +1,6 @@
+# 改动文件清单：每行一个相对路径（相对于项目根）
+# 空行和 # 开头的行会被忽略
+# 路径用 / 或 \ 都行
+src/utils/intent.py
+src/models/classifier.py
+config/base.yaml
