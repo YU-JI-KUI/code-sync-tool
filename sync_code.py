@@ -84,6 +84,21 @@ def read_file_list(list_path):
     return items
 
 
+def print_manifest_header(list_path):
+    """打印清单文件开头的 # 注释（push_to_both.py 写入的元信息：基于哪个 commit 等）。
+
+    遇到第一行非注释就停。让你在内网执行时一眼看出这次同步基于什么。
+    """
+    print("--- 清单元信息（来自外网生成时的快照）---")
+    with open(list_path, "r", encoding="utf-8-sig") as f:
+        for raw in f:
+            line = raw.rstrip()
+            if not line.startswith("#"):
+                break
+            print(f"  {line}")
+    print("-" * 42)
+
+
 def extract_zip(zip_path, work_dir):
     """把 zip 解压到 work_dir，返回真正的代码根目录。
 
@@ -107,11 +122,15 @@ def sync(code_root, project_root, items, dry_run):
     """核心：按 items 列表，复制或删除内网项目里的文件。
 
     items 是 (action, rel_path) 列表，action 为 "copy" 或 "delete"。
-    返回 (复制数, 删除数, 缺失列表)。删除时文件不存在就跳过，绝不报错。
+    返回统计字典。删除时文件不存在就跳过，绝不报错（这是预期行为）。
     """
-    copied = 0
-    deleted = 0
-    missing = []
+    stats = {
+        "added": 0,        # 新增（内网原本没有的复制）
+        "overwritten": 0,  # 覆盖（内网原本有的复制）
+        "deleted": 0,      # 真删除（内网原本存在）
+        "skipped_del": 0,  # 跳过删除（内网原本就不存在）
+        "missing": [],     # 清单要求复制但 zip 里没有的文件
+    }
 
     for action, rel in items:
         dst = os.path.join(project_root, rel)
@@ -119,40 +138,43 @@ def sync(code_root, project_root, items, dry_run):
         # ---- 删除 ----
         if action == "delete":
             if not os.path.isfile(dst):
-                # 内网本来就没有这个文件，跳过即可（你的要求：没有则跳过）
-                print(f"  [跳过删除] 内网没有： {rel}")
+                # 内网本来就没有这个文件，跳过即可（这是正常情况，不算错）
+                print(f"  [跳过删除] 内网原本不存在： {rel}")
+                stats["skipped_del"] += 1
                 continue
+            size_kb = os.path.getsize(dst) / 1024
             if dry_run:
-                print(f"  [预览-删除] {rel}")
-                deleted += 1
+                print(f"  [预览-删除] {rel}  ({size_kb:.1f} KB)")
+                stats["deleted"] += 1
                 continue
             os.remove(dst)
-            print(f"  [删除] {rel}")
-            deleted += 1
+            print(f"  [删除] {rel}  ({size_kb:.1f} KB)")
+            stats["deleted"] += 1
             continue
 
         # ---- 复制 ----
         src = os.path.join(code_root, rel)
         if not os.path.isfile(src):
-            # zip 里没有这个文件——可能清单写错了
-            missing.append(rel)
+            stats["missing"].append(rel)
             print(f"  [缺失] zip 里没有： {rel}")
             continue
 
-        verb = "覆盖" if os.path.exists(dst) else "新增"
+        if os.path.exists(dst):
+            verb, key = "覆盖", "overwritten"
+        else:
+            verb, key = "新增", "added"
+        size_kb = os.path.getsize(src) / 1024
         if dry_run:
-            print(f"  [预览-{verb}] {rel}")
-            copied += 1
+            print(f"  [预览-{verb}] {rel}  ({size_kb:.1f} KB)")
+            stats[key] += 1
             continue
 
-        # 确保目标目录存在（内网项目里可能还没这个子目录）
         os.makedirs(os.path.dirname(dst), exist_ok=True)
-        # copy2 会连同文件的修改时间等元信息一起拷过去，相当于完整复制
         shutil.copy2(src, dst)
-        print(f"  [{verb}] {rel}")
-        copied += 1
+        print(f"  [{verb}] {rel}  ({size_kb:.1f} KB)")
+        stats[key] += 1
 
-    return copied, deleted, missing
+    return stats
 
 
 def main():
@@ -183,21 +205,25 @@ def main():
         items = read_file_list(list_path)
         if not items:
             sys.exit("[错误] 改动清单里没有任何有效路径，检查一下 txt 内容。")
+
+        print_manifest_header(list_path)
         n_copy = sum(1 for a, _ in items if a == "copy")
         n_del = sum(1 for a, _ in items if a == "delete")
-        print(f"清单共 {len(items)} 项（复制 {n_copy}、删除 {n_del}）。\n")
+        print(f"\n清单共 {len(items)} 项（复制 {n_copy}、删除 {n_del}）。开始处理：\n")
 
-        copied, deleted, missing = sync(code_root, args.project_root, items, args.dry_run)
+        stats = sync(code_root, args.project_root, items, args.dry_run)
     finally:
-        # finally 保证不管中间报不报错，临时目录都会被清掉（类似 Java 的 try-finally）
         shutil.rmtree(work_dir, ignore_errors=True)
 
     print("\n" + "=" * 60)
     verb = "将" if args.dry_run else "已"
-    print(f"{verb}复制 {copied} 个、{verb}删除 {deleted} 个。缺失 {len(missing)} 个。")
-    if missing:
-        print("缺失列表（zip 里没找到，请检查清单或文件名）：")
-        for m in missing:
+    print(f"{verb}新增 {stats['added']} 个、{verb}覆盖 {stats['overwritten']} 个、"
+          f"{verb}删除 {stats['deleted']} 个。")
+    print(f"跳过删除（内网原本不存在）{stats['skipped_del']} 个、"
+          f"缺失（zip 里没有）{len(stats['missing'])} 个。")
+    if stats["missing"]:
+        print("\n缺失列表（zip 里没找到，请检查清单或重新下载 zip）：")
+        for m in stats["missing"]:
             print(f"  - {m}")
     if args.dry_run:
         print("\n这是预览。确认无误后，去掉 --dry-run 再跑一次即可真正复制。")

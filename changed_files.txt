@@ -1,6 +1,12 @@
-# 改动文件清单：每行一个相对路径（相对于项目根）
-# 空行和 # 开头的行会被忽略
-# 路径用 / 或 \ 都行
-src/utils/intent.py
-src/models/classifier.py
-config/base.yaml
+# 本次改动清单，由 push_to_both.py 自动生成
+# 普通行 = 复制到内网；[DEL] 开头 = 在内网删除该文件
+# 基于团队仓 master @ <8 位 sha>
+# 涉及 commit（动作以 team/master 为准：存在=复制、不存在=删除）:
+#   <sha1> <commit subject>
+#   <sha2> <commit subject>
+#
+# 这是一份样本文件，仅供查看清单格式参考。
+# 真实的 changed_files.txt 在每次 sync 时由脚本自动生成并强推到个人仓。
+src/example/some_file.py
+src/example/another_file.py
+[DEL] src/example/removed_file.py

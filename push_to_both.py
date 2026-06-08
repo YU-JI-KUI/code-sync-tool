@@ -4,26 +4,38 @@ push_to_both.py  —  外网（个人电脑）前置脚本
 
 背景：
     - 公司内网登录不了团队 GitHub，只能下 zip；且团队仓库内网也访问不到。
-    - 所以在外网把同一份代码推到两个仓库：
-        团队仓（干净的代码历史） + 个人仓（代码 + 本次改动清单 changed_files.txt）
-    - 内网只下个人仓的 zip，里面自带 changed_files.txt，配合 sync_code.py 同步改动。
+    - 我在外网开发时，代码会先正常进团队仓 master（PR merge 或 push）。
+    - 然后用这个脚本把「团队仓 master 的最新代码」+「本次要同步的 commit 解析出的 changed_files 清单」
+      推到个人仓，内网下个人仓的 zip，配合 sync_code.py 同步改动。
 
-关键设计（避免团队仓被污染）：
-    本地分支始终和团队仓保持一致，只有干净代码历史。
-    changed_files.txt 作为一个「临时提交」强推到个人仓顶端，推完本地立刻回退掉。
-    => 团队仓永远干净；个人仓顶端永远是「代码 + 最新清单」。
+关键设计（避免团队仓被污染、个人仓干净）：
+    本地 master 强制和团队仓 master 对齐 —— 不在本地做任何提交。
+    个人仓的内容 = 团队仓 master 的代码 + 一个临时清单提交（强推、每轮重写）。
+    => 团队仓全程不动；个人仓顶端永远是「最新 master 代码 + 本次清单」。
 
 两个子命令：
-    setup  —— 给当前本地仓配好 team / personal 两个 remote（只需跑一次）
+    setup —— 给当前本地仓配好 team / personal 两个 remote（只跑一次）
         python push_to_both.py setup
 
-    push   —— 日常一键双推（核心）
-        python push_to_both.py push --range HEAD~1..HEAD -m "feat: 改了意图识别"
+    sync  —— 日常一键同步（核心）
+        python push_to_both.py sync --commits <sha1> [<sha2> ...]
 
-    --range 是「本次要同步到内网的改动范围」，你自己决定。例如：
-        最近 1 个提交：  HEAD~1..HEAD
-        最近 3 个提交：  HEAD~3..HEAD
-        某两个提交之间： abc1234..def5678
+    --commits 可以是不连续的多个 commit（团队仓 master 上已经存在的提交），
+    顺序无所谓：
+        python push_to_both.py sync --commits <sha1> <sha2> <sha3>
+
+    动作的最终判定以【team/master 当前状态】为准（master 即 SSOT）：
+        - commit 列表收集到的所有"被触碰的"文件路径作为候选
+        - 候选里在 team/master 上仍存在 → 复制
+        - 候选里在 team/master 上不存在 → 删除
+    这样无论中间夹了多少 rename / revert，结果都和 master 一致。
+
+    脚本会：
+        1) fetch team，把本地 master reset --hard 到 team/master（要求工作区干净）
+        2) 对每个 commit 跑 git show 收集所有被触碰的文件路径
+        3) 拿这些路径去 team/master 文件树里查存在性 → 决定复制 / 删除
+        4) 写 changed_files.txt，临时提交后强推到 personal/master
+        5) 本地 reset 回 team/master，保持干净
 """
 
 import argparse
@@ -37,6 +49,7 @@ TEAM_URL = "git@github.com:cangjie-ai/ark-agentic.git"
 PERSONAL_REMOTE = "personal"    # 个人仓 remote 名
 PERSONAL_URL = "git@github.com:YU-JI-KUI/ark-agentic.git"
 
+DEFAULT_BRANCH = "master"       # 团队仓 / 个人仓的目标分支
 MANIFEST = "changed_files.txt"  # 改动清单文件名（会进个人仓 zip 根目录）
 # =======================================================
 
@@ -51,7 +64,7 @@ def run(cmd, capture=False, check=True):
     print(f"  $ {' '.join(cmd)}")
     result = subprocess.run(
         cmd,
-        text=True,                              # 用文本模式，输出是 str 不是 bytes
+        text=True,
         capture_output=capture,
         encoding="utf-8",
     )
@@ -63,8 +76,12 @@ def run(cmd, capture=False, check=True):
 
 
 def git_output(args):
-    """跑 git 并返回标准输出（去掉首尾空白）。"""
-    return run(["git"] + args, capture=True).strip()
+    """跑 git 并返回标准输出（去掉首尾空白）。
+
+    `-c core.quotepath=false` 让 git 不要对非 ASCII 路径做八进制转义
+    （否则中文文件名会输出成 "\346\270\262..." 这种字符串，传给下游脚本会找不到文件）。
+    """
+    return run(["git", "-c", "core.quotepath=false"] + args, capture=True).strip()
 
 
 def ensure_in_git_repo():
@@ -89,6 +106,33 @@ def add_or_update_remote(name, url):
         run(["git", "remote", "add", name, url])
 
 
+def resolve_commit(sha):
+    """把用户传的 commit 短 SHA 解析成完整 SHA。解析失败直接退出。"""
+    result = subprocess.run(
+        ["git", "rev-parse", "--verify", f"{sha}^{{commit}}"],
+        text=True,
+        capture_output=True,
+        encoding="utf-8",
+    )
+    if result.returncode != 0:
+        sys.exit(f"[错误] commit 不存在或无法解析：{sha}\n{result.stderr.strip()}")
+    return result.stdout.strip()
+
+
+def commit_touched_files(full_sha):
+    """跑 git show 拿单个 commit 触碰过的所有文件路径（新+旧），不区分动作。
+
+    --no-renames       ：关闭 rename 检测，让 rename 拆成 "删旧路径 + 加新路径"
+                         两条记录，旧路径才能进入候选集
+    -m --first-parent  ：merge commit 也能正确展开成相对第一父提交的 diff
+    """
+    lines = git_output([
+        "show", "--name-only", "--pretty=format:",
+        "--no-renames", "-m", "--first-parent", full_sha,
+    ]).splitlines()
+    return [f.strip() for f in lines if f.strip() and f.strip() != MANIFEST]
+
+
 # ---------------- setup 子命令 ----------------
 def cmd_setup(args):
     ensure_in_git_repo()
@@ -97,49 +141,77 @@ def cmd_setup(args):
     add_or_update_remote(PERSONAL_REMOTE, args.personal_url)
     print("\n当前 remote 列表：")
     print(git_output(["remote", "-v"]))
-    print("\n配置完成。以后日常用： python push_to_both.py push --range HEAD~1..HEAD")
+    print("\n配置完成。以后日常用： python push_to_both.py sync --commits <sha1> [<sha2> ...]")
 
 
-# ---------------- push 子命令 ----------------
-def cmd_push(args):
+# ---------------- sync 子命令 ----------------
+def cmd_sync(args):
     ensure_in_git_repo()
 
     if not remote_exists(TEAM_REMOTE) or not remote_exists(PERSONAL_REMOTE):
-        sys.exit(f"[错误] remote 没配好，请先跑： python push_to_both.py setup")
+        sys.exit("[错误] remote 没配好，请先跑： python push_to_both.py setup")
 
-    branch = git_output(["rev-parse", "--abbrev-ref", "HEAD"])
-    print(f"当前分支：{branch}\n")
-
-    # 1) 如果有未提交改动且给了 -m，就先把代码提交成一个干净提交
+    # 工作区必须干净 —— 新流程不在本地做任何提交
     status = git_output(["status", "--porcelain"])
     if status:
-        if not args.message:
-            sys.exit("[错误] 有未提交改动，请用 -m \"提交说明\" 让脚本提交，或先自己 git commit。")
-        print("步骤 1/5：提交代码")
-        run(["git", "add", "-A"])
-        run(["git", "commit", "-m", args.message])
-    else:
-        print("步骤 1/5：工作区干净，跳过提交（假设代码已提交）")
+        sys.exit(
+            "[错误] 工作区有未提交改动。新流程假设代码已经在团队仓 master 上，\n"
+            "       本地不应有任何未提交变化。请自行处理（commit / stash / 丢弃）后再跑。"
+        )
 
-    code_tip = git_output(["rev-parse", "HEAD"])  # 记住代码提交点，最后要回退到这里
+    branch = args.branch
 
-    # 2) 把干净的代码历史推到团队仓
-    print("\n步骤 2/5：推送到团队仓")
-    run(["git", "push", TEAM_REMOTE, branch])
+    # 1) 拉团队仓最新 master，本地强制对齐
+    print(f"步骤 1/5：拉团队仓最新 {branch} 并强制对齐本地")
+    run(["git", "fetch", TEAM_REMOTE, branch])
+    run(["git", "checkout", branch])
+    run(["git", "reset", "--hard", f"{TEAM_REMOTE}/{branch}"])
 
-    # 3) 按你给的范围生成改动清单（区分「复制」和「删除」）
-    #    复制：--diff-filter=ACMRT = 新增/复制/修改/重命名/类型变更 的文件
-    #    删除：--diff-filter=D     = 被删掉的文件
-    print(f"\n步骤 3/5：生成改动清单（范围 {args.range}）")
-    diff_copy = git_output(["diff", "--name-only", "--diff-filter=ACMRT", args.range])
-    diff_del = git_output(["diff", "--name-only", "--diff-filter=D", args.range])
-    copy_files = [f for f in diff_copy.splitlines() if f.strip() and f.strip() != MANIFEST]
-    del_files = [f for f in diff_del.splitlines() if f.strip() and f.strip() != MANIFEST]
-    if not copy_files and not del_files:
-        sys.exit(f"[错误] 范围 {args.range} 内没有改动文件，检查 --range 是否写对。")
+    code_tip = git_output(["rev-parse", "HEAD"])
+    print(f"  本地 {branch} 已对齐到 {code_tip[:8]}")
+
+    # 2) 解析用户指定的若干 commit（可以不连续，顺序无所谓）
+    print(f"\n步骤 2/5：解析 {len(args.commits)} 个指定 commit")
+    resolved = []
+    for sha in args.commits:
+        full = resolve_commit(sha)
+        merge_base = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", full, code_tip],
+            capture_output=True,
+        )
+        if merge_base.returncode != 0:
+            sys.exit(
+                f"[错误] commit {sha} ({full[:8]}) 不在团队仓 {branch} 历史里。\n"
+                f"       请确认这个提交已经合入团队仓 {branch}。"
+            )
+        subject = git_output(["log", "-1", "--pretty=format:%s", full])
+        resolved.append((full, subject))
+        print(f"    {full[:8]}  {subject}")
+
+    # 3) 收集候选文件 → 用 team/master 真实文件树定动作
+    print("\n步骤 3/5：以 team/master 为准定动作（存在=复制 / 不存在=删除）")
+    candidates = {}  # path -> None，dict 保插入顺序便于稳定输出
+    for full, _ in resolved:
+        for f in commit_touched_files(full):
+            candidates.setdefault(f, None)
+
+    if not candidates:
+        sys.exit("[错误] 指定的 commit 没有触碰任何文件，请检查 --commits 是否写对。")
+
+    master_files = set(git_output(
+        ["ls-tree", "-r", "--name-only", f"{TEAM_REMOTE}/{branch}"]
+    ).splitlines())
+
+    copy_files = [f for f in candidates if f in master_files]
+    del_files = [f for f in candidates if f not in master_files]
+
     with open(MANIFEST, "w", encoding="utf-8") as f:
         f.write("# 本次改动清单，由 push_to_both.py 自动生成\n")
         f.write("# 普通行 = 复制到内网；[DEL] 开头 = 在内网删除该文件\n")
+        f.write(f"# 基于团队仓 {branch} @ {code_tip[:8]}\n")
+        f.write(f"# 涉及 commit（动作以 team/master 为准：存在=复制、不存在=删除）:\n")
+        for full, subject in resolved:
+            f.write(f"#   {full[:8]} {subject}\n")
         for rel in copy_files:
             f.write(rel + "\n")
         for rel in del_files:
@@ -150,22 +222,21 @@ def cmd_push(args):
     for rel in del_files:
         print(f"    [删除] {rel}")
 
-    # 4) 把清单作为「临时提交」放到代码提交之上，强推到个人仓
+    # 4) 把清单作为「临时提交」放到 master 顶端，强推到个人仓
     print("\n步骤 4/5：清单临时提交并强推到个人仓")
     run(["git", "add", MANIFEST])
     run(["git", "commit", "-m", "sync: update changed_files manifest"])
-    # +branch 等价于 --force 推这个分支：个人仓每轮都被重写成「代码 + 最新清单」
     run(["git", "push", PERSONAL_REMOTE, f"+{branch}"])
 
-    # 5) 本地回退掉清单提交，让本地分支重新等于团队仓（保持干净）
-    print("\n步骤 5/5：本地回退临时提交，保持与团队仓一致")
+    # 5) 本地回退掉清单提交，让本地 master 重新等于团队仓 master
+    print(f"\n步骤 5/5：本地回退临时提交，保持与团队仓 {branch} 一致")
     run(["git", "reset", "--hard", code_tip])
 
     print("\n" + "=" * 60)
     print("完成！")
-    print(f"  团队仓 {TEAM_REMOTE}    : 干净代码历史")
-    print(f"  个人仓 {PERSONAL_REMOTE}: 代码 + {MANIFEST}（内网下这个仓的 zip）")
-    print(f"  本地分支已回到 {code_tip[:8]}，与团队仓一致")
+    print(f"  团队仓 {TEAM_REMOTE}/{branch}    : 未动")
+    print(f"  个人仓 {PERSONAL_REMOTE}/{branch}: 团队仓 {code_tip[:8]} 代码 + {MANIFEST}")
+    print(f"  本地 {branch} 已回到 {code_tip[:8]}")
     print("=" * 60)
 
 
@@ -178,12 +249,14 @@ def main():
     p_setup.add_argument("--personal-url", default=PERSONAL_URL)
     p_setup.set_defaults(func=cmd_setup)
 
-    p_push = sub.add_parser("push", help="一键双推")
-    p_push.add_argument("--range", default="HEAD~1..HEAD",
-                        help="本次同步到内网的改动范围，默认最近一个提交 HEAD~1..HEAD")
-    p_push.add_argument("-m", "--message", default=None,
-                        help="若有未提交改动，用这个说明提交代码")
-    p_push.set_defaults(func=cmd_push)
+    p_sync = sub.add_parser("sync", help="拉团队仓最新代码 + 指定 commit 的改动清单，推个人仓")
+    p_sync.add_argument(
+        "--commits", nargs="+", required=True, metavar="SHA",
+        help="本次同步涉及的 commit（可多个、不连续），均需已合入团队仓 master",
+    )
+    p_sync.add_argument("--branch", default=DEFAULT_BRANCH,
+                        help=f"目标分支，默认 {DEFAULT_BRANCH}")
+    p_sync.set_defaults(func=cmd_sync)
 
     args = parser.parse_args()
     args.func(args)
