@@ -29,11 +29,13 @@ python push_to_both.py setup
 python push_to_both.py sync --commits abc1234 def5678 9012345
 ```
 
-内网：
+内网（`--zip` 支持通配符，浏览器下第二份加 `(1)(2)` 后缀也不用改命令）：
 
 ```cmd
-python sync_code.py --zip ark-agentic-master.zip --project D:\work\ark-agentic --dry-run
-python sync_code.py --zip ark-agentic-master.zip --project D:\work\ark-agentic
+python sync_code.py --zip "C:\Downloads\ark-agentic-master*.zip" --project D:\work\ark-agentic --dry-run
+python sync_code.py --zip "C:\Downloads\ark-agentic-master*.zip" --project D:\work\ark-agentic
 ```
+
+多个匹配时自动选 mtime 最新的（= 你刚下载的那份）。命令固定后可以一直复用。
 
 纯 Python 标准库，无需安装依赖；命令均为 Windows CMD 兼容。

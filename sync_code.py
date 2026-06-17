@@ -19,10 +19,15 @@ sync_code.py  —  把 GitHub 下载的 zip 包里的改动文件，复制到内
         python sync_code.py --zip code.zip --project D:\work\myproj --list changed_files.txt
         python sync_code.py ... --dry-run     （只预览不真正复制，建议第一次先跑这个）
 
+    --zip 支持通配符：浏览器下第二份同名 zip 会加 (1)(2) 后缀，用通配符可一劳永逸
+        python sync_code.py --zip "C:\Downloads\ark-agentic-master*.zip" --project D:\work\ark-agentic
+        （多个匹配时按修改时间自动选最新的那个，命令永远不用改）
+
 策略：同名文件 **直接覆盖**（按你的选择）。
 """
 
 import argparse
+import glob
 import os
 import shutil
 import sys
@@ -43,7 +48,10 @@ def parse_args():
     类似 Java 里自己解析 args[] 但省事很多。default=XXX 就是缺省值。
     """
     p = argparse.ArgumentParser(description="把 GitHub zip 里的改动文件同步到内网项目")
-    p.add_argument("--zip", dest="zip_path", default=ZIP_PATH, help="GitHub 下载的 zip 路径")
+    p.add_argument("--zip", dest="zip_path", default=ZIP_PATH,
+                   help=r"GitHub 下载的 zip 路径，支持通配符。"
+                        r"例如 --zip C:\Downloads\ark-agentic-master*.zip 会自动选最新的那个，"
+                        r"不用关心浏览器加的 (1)(2) 后缀。")
     p.add_argument("--project", dest="project_root", default=PROJECT_ROOT, help="内网项目根目录")
     # 注意 default=None：不传 --list 时，自动用 zip 里自带的 changed_files.txt
     p.add_argument("--list", dest="list_path", default=None,
@@ -177,8 +185,39 @@ def sync(code_root, project_root, items, dry_run):
     return stats
 
 
+def resolve_zip_path(pattern):
+    """把用户传的 --zip 解析成真实文件路径。
+
+    支持两种形式：
+      1) 精确路径：原样返回（保持向后兼容）
+      2) 通配符（含 * 或 ?）：匹配所有候选，按修改时间挑最新的那个
+
+    这是为了解决"浏览器下第二份同名 zip 会被加 (1)(2) 后缀"导致命令必须改名的痛点。
+    用户写 ark-agentic-master*.zip，永远拿到最新下载的那一份。
+    """
+    if "*" not in pattern and "?" not in pattern:
+        return pattern
+
+    matches = glob.glob(pattern)
+    if not matches:
+        sys.exit(f"[错误] 通配符 {pattern} 没匹配到任何文件。\n"
+                 f"  检查路径是否写对、zip 是否真的在那个目录下。")
+
+    matches.sort(key=os.path.getmtime, reverse=True)
+    chosen = matches[0]
+    if len(matches) > 1:
+        print(f"通配符 {pattern} 匹配到 {len(matches)} 个文件，选最新的：")
+        for m in matches[:5]:
+            mark = " <-- 用这个" if m == chosen else ""
+            print(f"    {m}{mark}")
+        if len(matches) > 5:
+            print(f"    ... 另有 {len(matches) - 5} 个")
+    return chosen
+
+
 def main():
     args = parse_args()
+    args.zip_path = resolve_zip_path(args.zip_path)
 
     print("=" * 60)
     print(f"zip 包       : {args.zip_path}")
